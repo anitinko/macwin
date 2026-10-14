@@ -49,7 +49,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=1.1.8"
 tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 ring = "=0.17.14"
 spake2 = "=0.4.0"

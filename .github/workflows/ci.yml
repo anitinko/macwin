@@ -37,15 +37,20 @@ jobs:
       - name: Shell scripts parse
         shell: bash
         run: for f in scripts/*/*.sh; do bash -n "$f"; done
-      - name: PowerShell scripts parse
+      # Windows PowerShell 5.1 (what install.ps1 runs on) reads files without
+      # a BOM as ANSI, so the scripts stay ASCII.
+      - name: PowerShell scripts parse (Windows PowerShell 5.1, ASCII)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           $failed = $false
           foreach ($f in Get-ChildItem scripts/windows/*.ps1) {
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors) | Out-Null
             foreach ($e in $errors) { Write-Host "$($f.Name): $e"; $failed = $true }
+            if ([IO.File]::ReadAllBytes($f.FullName) | Where-Object { $_ -gt 127 }) {
+              Write-Host "$($f.Name): non-ASCII bytes"; $failed = $true
+            }
           }
           if ($failed) { exit 1 }
 

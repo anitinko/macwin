@@ -3,11 +3,12 @@
 //! share, pause, change a setting, hit the emergency chord and quit.
 
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use macwin_agent::config::Config;
+use macwin_agent::config::{Config, PeerConfig};
 use macwin_agent::driver::Backends;
 use macwin_agent::lan::Discovery;
 use macwin_agent::tray::{self, DiscoverySource, TrayEnv, run_tray};
@@ -40,20 +41,48 @@ struct Machine {
     task: JoinHandle<anyhow::Result<()>>,
     captures: Arc<Mutex<Vec<FakeCaptureHandle>>>,
     view: Option<TrayView>,
+    /// Every status line shown, oldest first.
+    statuses: Vec<String>,
     dialog: Option<(u32, Dialog)>,
     quit: bool,
 }
 
+#[derive(Default)]
+struct Setup {
+    /// The loopback "LAN" of discovery; `None` turns it off.
+    lan: Option<SocketAddr>,
+    peer: Option<PeerConfig>,
+    /// The first attempt to start the backends fails.
+    fail_first: bool,
+}
+
 fn start(name: &str, os: Os, lan: SocketAddr) -> Machine {
+    start_with(
+        name,
+        os,
+        Setup {
+            lan: Some(lan),
+            ..Setup::default()
+        },
+    )
+}
+
+fn start_with(name: &str, os: Os, setup: Setup) -> Machine {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         listen: format!("127.0.0.1:{}", free_port()).parse().unwrap(),
+        peer: setup.peer,
         ..Config::default()
     };
     config.save(dir.path()).unwrap();
     let captures = Arc::new(Mutex::new(Vec::new()));
     let made = captures.clone();
+    let calls = AtomicUsize::new(0);
+    let fail_first = setup.fail_first;
     let backends = move |clipboard: bool| -> Result<Backends, PlatformError> {
+        if fail_first && calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(PlatformError::Backend("no display".into()));
+        }
         let (capture, handle) = FakeCapture::new();
         made.lock().unwrap().push(handle);
         Ok(Backends {
@@ -77,7 +106,7 @@ fn start(name: &str, os: Os, lan: SocketAddr) -> Machine {
         identity: Identity::generate().unwrap(),
         os,
         device_name: name.into(),
-        discovery: DiscoverySource::Fixed(Some(Discovery::at(lan))),
+        discovery: DiscoverySource::Fixed(setup.lan.map(Discovery::at)),
         backends: Arc::new(backends),
         autostart: None,
         retry: Some((
@@ -95,6 +124,7 @@ fn start(name: &str, os: Os, lan: SocketAddr) -> Machine {
         task,
         captures,
         view: None,
+        statuses: Vec::new(),
         dialog: None,
         quit: false,
     }
@@ -104,7 +134,12 @@ impl Machine {
     fn drain(&mut self) {
         while let Ok(c) = self.commands.try_recv() {
             match c {
-                UiCommand::Update(v) => self.view = Some(v),
+                UiCommand::Update(v) => {
+                    if let Some(MenuItem::Label(l)) = v.items.first() {
+                        self.statuses.push(l.clone());
+                    }
+                    self.view = Some(v);
+                }
                 UiCommand::Open { id, dialog } => self.dialog = Some((id, dialog)),
                 UiCommand::Close { id } => {
                     if self.dialog.as_ref().is_some_and(|(d, _)| *d == id) {
@@ -166,6 +201,21 @@ impl Machine {
                 text: text.into(),
             })
             .unwrap();
+    }
+
+    /// The address a waiting machine shows for "Pair by address...".
+    fn shown_address(&self) -> String {
+        let after = self
+            .message()
+            .split("and enter ")
+            .nth(1)
+            .expect("an address");
+        after
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .trim_end_matches('.')
+            .to_string()
     }
 
     /// The code shown by a waiting machine.
@@ -307,6 +357,92 @@ async fn cancelling_pairing_closes_the_code() {
         m.dialog.is_none() && m.status() == "Not paired"
     })
     .await;
+    m.click(tray::QUIT);
+    m.wait("quit", |m| m.quit).await;
+    m.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_discovery_trays_pair_by_address() {
+    let mut pc = start_with("pc", Os::Windows, Setup::default());
+    pc.click(tray::PAIR);
+    pc.wait("a code", |m| m.message().starts_with("Enter this code"))
+        .await;
+    assert!(
+        pc.message().contains("LAN discovery is off"),
+        "{}",
+        pc.message()
+    );
+    let (address, code) = (pc.shown_address(), pc.code());
+    assert!(address.starts_with("127.0.0.1:"), "{address}");
+
+    // The Mac finds nobody either and waits; it switches to the address.
+    let mut mac = start_with("mac", Os::MacOs, Setup::default());
+    mac.click(tray::PAIR);
+    mac.wait("its own code", |m| {
+        m.message().starts_with("Enter this code")
+    })
+    .await;
+    mac.answer(Some(1), "");
+    mac.wait("the address question", |m| m.asks(&["Cancel", "Next"]))
+        .await;
+    mac.answer(Some(1), "not an address!");
+    mac.wait("the question again", |m| {
+        m.asks(&["Cancel", "Next"]) && m.message().contains("is not an address")
+    })
+    .await;
+    mac.answer(Some(1), &address);
+    mac.wait("the code question", |m| m.asks(&["Cancel", "Pair"]))
+        .await;
+    mac.answer(Some(1), &code);
+    mac.wait("the side question", |m| m.asks(&["Left", "Right"]))
+        .await;
+    pc.wait("the side question", |m| m.asks(&["Left", "Right"]))
+        .await;
+    mac.answer(Some(1), "");
+    pc.answer(Some(0), "");
+    mac.wait("connected", connected_to("pc")).await;
+    pc.wait("connected", connected_to("mac")).await;
+    let peer = Config::load(mac.dir.path()).unwrap().peer.unwrap();
+    assert_eq!(peer.address.as_deref(), Some(address.as_str()));
+
+    mac.click(tray::QUIT);
+    pc.click(tray::QUIT);
+    mac.wait("quit", |m| m.quit).await;
+    pc.wait("quit", |m| m.quit).await;
+    mac.finish().await;
+    pc.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sharing_restarts_after_an_error() {
+    let peer = PeerConfig {
+        fingerprint: Identity::generate().unwrap().fingerprint(),
+        name: "pc".into(),
+        os: Os::Windows,
+        side: Some(Side::Left),
+        address: None,
+    };
+    let mut m = start_with(
+        "mac",
+        Os::MacOs,
+        Setup {
+            peer: Some(peer),
+            fail_first: true,
+            ..Setup::default()
+        },
+    );
+    m.wait("waiting after the restart", |m| {
+        m.status() == "Waiting for \u{201c}pc\u{201d}\u{2026}"
+    })
+    .await;
+    assert!(
+        m.statuses
+            .iter()
+            .any(|s| s.starts_with("Error: cannot start the input backends")),
+        "{:?}",
+        m.statuses
+    );
     m.click(tray::QUIT);
     m.wait("quit", |m| m.quit).await;
     m.finish().await;

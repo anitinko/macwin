@@ -63,8 +63,8 @@ Application" identity and notarized, which the script does not do. The zip
 holds `macwin.exe`, `macwin-tray.exe`, `install.ps1`, `uninstall.ps1` and a
 README; `install.ps1` installs for the current user into
 `%LOCALAPPDATA%\Programs\MacWin`, adds it to the PATH, starts the tray at
-login and adds firewall rules for private networks after one administrator
-prompt. The executables are not code-signed, so SmartScreen may warn.
+login and adds firewall rules for private and domain networks after one
+administrator prompt. The executables are not code-signed, so SmartScreen may warn.
 
 ## Usage
 
@@ -81,13 +81,19 @@ the other machine is connected, and its menu has:
 
 - **Pair with the other computer...**: looks for a machine that waits for
   pairing on the LAN and asks for its code; when there is none, this machine
-  waits and shows a code. Do it on both machines. Afterwards each asks on
-  which side the other machine's screens are.
+  waits and shows a code and its address. Do it on both machines. When
+  broadcasts do not get through (another subnet, a guest Wi-Fi), click
+  **Pair by address...** in one machine's code window and enter the address
+  the other one shows. Afterwards each asks on which side the other
+  machine's screens are.
 - **Pause sharing / Resume sharing**, **Share the clipboard**,
   **"PC" is on the left / right**, **Start at login**, **Quit MacWin**.
 
-The emergency chord pauses sharing; Resume starts it again. Only one MacWin
-(tray, `run` or `pair`) runs per user at a time. The tray logs to
+The emergency chord pauses sharing; Resume starts it again. After an error
+(for example a permission that is still missing) the tray tries again by
+itself, after 5 s and then up to every minute; the tooltip shows the last
+connection problem. Only one MacWin (tray, `run` or `pair`) runs per user at
+a time: quit the tray before using `macwin pair` or `macwin run`. The tray logs to
 `~/Library/Logs/macwin/macwin.log` (Windows `%LOCALAPPDATA%\macwin\macwin.log`).
 
 ### 1. Pair the machines (once), from a terminal

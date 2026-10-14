@@ -35,8 +35,9 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir "$STAGE/$NAME"
 cp "$OUT/macwin.exe" "$OUT/macwin-tray.exe" "$STAGE/$NAME/"
-# Windows tools expect CRLF line ends in text files.
-crlf() { sed 's/$/\r/' "$1" >"$2"; }
+# Windows tools expect CRLF line ends in text files (awk: BSD sed on macOS
+# does not understand \r).
+crlf() { awk '{ printf "%s\r\n", $0 }' "$1" >"$2"; }
 crlf scripts/windows/install.ps1 "$STAGE/$NAME/install.ps1"
 crlf scripts/windows/uninstall.ps1 "$STAGE/$NAME/uninstall.ps1"
 crlf scripts/windows/README.txt "$STAGE/$NAME/README.txt"

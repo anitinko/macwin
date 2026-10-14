@@ -84,7 +84,7 @@ fn supported_os() -> anyhow::Result<macwin_core::types::Os> {
 /// The address the other machine should dial: the bound IP, or for a
 /// wildcard bind the IP of the default route (found without sending
 /// anything: connecting a UDP socket only picks a route).
-fn reachable_ip(local: SocketAddr) -> Option<IpAddr> {
+pub fn reachable_ip(local: SocketAddr) -> Option<IpAddr> {
     if !local.ip().is_unspecified() {
         return Some(local.ip());
     }
@@ -165,10 +165,12 @@ pub async fn announce_pairing(
     info: &PairInfo,
 ) -> Option<Responder> {
     let d = discovery?;
+    // The protocol takes at most 256 bytes; a long Computer Name must not
+    // make this machine undiscoverable.
     let offer = Offer::Pairing {
         port,
         os: info.os,
-        device_name: info.device_name.clone(),
+        device_name: info.device_name.chars().take(64).collect(),
     };
     match Responder::start(d.bind, offer).await {
         Ok(r) => Some(r),
@@ -274,8 +276,8 @@ pub fn save_pairing(
 
 pub async fn pair(args: PairArgs) -> anyhow::Result<()> {
     let os = supported_os()?;
+    let _lock = instance::lock(&config_dir(|k| std::env::var_os(k))?)?;
     let id = load_identity()?;
-    let _lock = instance::lock(&id.config_dir)?;
     let config = Config::load(&id.config_dir)?;
     let discovery = Discovery::from_env(config.discovery, |k| std::env::var_os(k))?;
     let info = PairInfo {
@@ -442,7 +444,7 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
 
 fn print_event(e: RunEvent) {
     match e {
-        RunEvent::Moved(addr) => println!("found the peer at its new address {addr}"),
+        RunEvent::Moved(addr) => println!("the peer answered a LAN search at {addr}"),
         RunEvent::Listening(addr) => println!("listening on {addr}"),
         RunEvent::Dialing(target) => println!("connecting to {target}"),
         RunEvent::Connected { name, remote } => println!("connected to \"{name}\" ({remote})"),
@@ -464,8 +466,8 @@ fn print_event(e: RunEvent) {
 pub async fn run() -> anyhow::Result<()> {
     let os = supported_os()?;
     platform::init();
+    let _lock = instance::lock(&config_dir(|k| std::env::var_os(k))?)?;
     let id = load_identity()?;
-    let _lock = instance::lock(&id.config_dir)?;
     let config = Config::load(&id.config_dir)?;
     let staging = macwin_net::cache_dir(|k| std::env::var_os(k))?.join("incoming");
     let discovery = Discovery::from_env(config.discovery, |k| std::env::var_os(k))?;

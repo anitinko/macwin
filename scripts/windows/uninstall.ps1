@@ -21,10 +21,12 @@ $ErrorActionPreference = 'Stop'
 $Dest = Join-Path $env:LOCALAPPDATA 'Programs\MacWin'
 Set-Location -LiteralPath $env:TEMP
 
-Get-Process -Name 'macwin-tray', 'macwin' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and $_.Path.StartsWith($Dest, [StringComparison]::OrdinalIgnoreCase) } |
-    Stop-Process -Force
-Start-Sleep -Milliseconds 500
+$running = @(Get-Process -Name 'macwin-tray', 'macwin' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path.StartsWith("$Dest\", [StringComparison]::OrdinalIgnoreCase) })
+if ($running.Count -gt 0) {
+    $running | Stop-Process -Force
+    $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+}
 
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'MacWin' -ErrorAction SilentlyContinue
 

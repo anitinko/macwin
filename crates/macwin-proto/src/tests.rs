@@ -743,6 +743,11 @@ proptest! {
         let _ = decode_datagram(&bytes);
         let _ = decode_clipboard(&bytes);
         let _ = decode_pair(&bytes);
+        let _ = decode_discovery(&bytes);
+        // Discovery datagrams come from anyone on the LAN.
+        let mut magic = DISCOVERY_MAGIC.to_vec();
+        magic.extend_from_slice(&bytes);
+        let _ = decode_discovery(&magic);
     }
 }
 

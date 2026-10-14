@@ -12,12 +12,14 @@ Install
        powershell -ExecutionPolicy Bypass -File .\install.ps1
 
      MacWin is copied to %LOCALAPPDATA%\Programs\MacWin, starts at login and
-     is allowed through Windows Firewall on private networks (Windows asks
-     for administrator rights once).
+     is allowed through Windows Firewall on private and domain networks
+     (Windows asks for administrator rights once).
   3. Click the MacWin icon in the notification area (it may hide behind the
      ^ arrow) and choose "Pair with the other computer...". Do the same on
-     the Mac: one computer shows a code, the other one asks for it. Then say
-     on which side the other computer's screens are.
+     the Mac: one computer shows a code, the other one asks for it. If they
+     do not find each other, click "Pair by address..." in one code window
+     and enter the address shown in the other one. Then say on which side
+     the other computer's screens are.
 
 Use
   Push the mouse over the shared screen edge to control the other computer;

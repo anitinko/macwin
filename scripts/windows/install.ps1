@@ -36,10 +36,12 @@ foreach ($f in $Files) {
 }
 
 # A running copy keeps its files locked.
-Get-Process -Name 'macwin-tray', 'macwin' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and $_.Path.StartsWith($Dest, [StringComparison]::OrdinalIgnoreCase) } |
-    Stop-Process -Force
-Start-Sleep -Milliseconds 500
+$running = @(Get-Process -Name 'macwin-tray', 'macwin' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path.StartsWith("$Dest\", [StringComparison]::OrdinalIgnoreCase) })
+if ($running.Count -gt 0) {
+    $running | Stop-Process -Force
+    $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+}
 
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 foreach ($f in $Files) {
@@ -79,6 +81,7 @@ if (-not $NoFirewall) {
     # Earlier answers to the firewall prompt become rules of their own (a
     # block rule would win over an allow rule): replace them.
     $rules = @"
+`$ErrorActionPreference = 'Stop'
 Remove-NetFirewallRule -Group 'MacWin' -ErrorAction SilentlyContinue
 foreach (`$p in @('$tray', '$cli')) {
     Get-NetFirewallApplicationFilter -Program `$p -ErrorAction SilentlyContinue | Get-NetFirewallRule | Remove-NetFirewallRule
@@ -98,6 +101,6 @@ New-NetFirewallRule -Group 'MacWin' -DisplayName 'MacWin (command line)' -Direct
     }
 }
 
-Start-Process -FilePath (Join-Path $Dest 'macwin-tray.exe')
+Start-Process -FilePath (Join-Path $Dest 'macwin-tray.exe') -WorkingDirectory $Dest
 Write-Host "MacWin is installed in $Dest; its icon is in the notification area."
 Write-Host 'Pair it from the icon menu ("Pair with the other computer..."), or run: macwin pair'

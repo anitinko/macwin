@@ -27,13 +27,15 @@ use tokio::task::{JoinError, JoinHandle};
 use tracing::{error, info, warn};
 
 use crate::autostart::{self, Autostart, State as AutostartState};
-use crate::commands::{MAX_PAIR_ATTEMPTS, announce_pairing, save_pairing, wait_for_pairing};
-use crate::config::Config;
+use crate::commands::{
+    MAX_PAIR_ATTEMPTS, announce_pairing, reachable_ip, save_pairing, wait_for_pairing,
+};
+use crate::config::{Config, normalize_address};
 use crate::driver::Backends;
 use crate::instance::{self, AlreadyRunning};
 use crate::lan::Discovery;
 use crate::launch::{Launch, NotReady};
-use crate::runner::{self, RunEvent, RunExit, bind_for};
+use crate::runner::{self, RunEvent, RunExit, bind_for, resolve};
 use crate::{error_chain, host_os, platform};
 
 pub const PAUSE: ItemId = 1;
@@ -46,6 +48,10 @@ pub const QUIT: ItemId = 7;
 
 /// Bound on stopping a running session (the runner drains for 2 s).
 const STOP_WAIT: Duration = Duration::from_secs(5);
+/// First and longest pause before sharing restarts after an error (a
+/// display change, a permission granted later).
+const RESTART_MIN: Duration = Duration::from_secs(5);
+const RESTART_MAX: Duration = Duration::from_secs(60);
 const CANCELLED: &str = "pairing cancelled";
 
 /// What the icon says.
@@ -73,6 +79,8 @@ pub struct Model {
     pub clipboard: bool,
     /// `None`: no login item on this OS.
     pub autostart: Option<bool>,
+    /// The last connection problem, for the tooltip.
+    pub detail: Option<String>,
 }
 
 fn quoted(name: &str) -> String {
@@ -161,9 +169,13 @@ pub fn view(m: &Model) -> TrayView {
         Status::Paused | Status::EmergencyStop => TrayState::Paused,
         Status::NotPaired | Status::NoSide | Status::Error(_) => TrayState::Attention,
     };
+    let tooltip = match &m.detail {
+        Some(d) if matches!(m.status, Status::Waiting) => format!("MacWin: {status} ({d})"),
+        _ => format!("MacWin: {status}"),
+    };
     TrayView {
         state,
-        tooltip: short(&format!("MacWin: {status}"), 120),
+        tooltip: short(&tooltip, 120),
         items,
     }
 }
@@ -192,10 +204,29 @@ pub struct TrayEnv {
     pub retry: Option<(Duration, Duration, Duration)>,
 }
 
+/// How a pairing task finds the other machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairMode {
+    /// Search the LAN; wait with a code when nobody waits.
+    Search,
+    /// Ask for the address shown on the other machine.
+    Address,
+}
+
 /// Progress of a pairing task.
 enum PairProgress {
-    /// This machine waits; the other one has to enter `code`.
-    Code(PairingCode),
+    /// This machine waits; the other one has to enter `code`. `address` is
+    /// where it can be dialed, `note` says why it may not be found.
+    Code {
+        code: PairingCode,
+        address: Option<String>,
+        note: Option<String>,
+    },
+    /// Ask for the other machine's address.
+    AskAddress {
+        note: Option<&'static str>,
+        reply: oneshot::Sender<Option<String>>,
+    },
     /// A machine waits for pairing: ask for its code.
     Ask {
         name: String,
@@ -209,6 +240,7 @@ enum PairProgress {
 enum Purpose {
     Code,
     AskCode(oneshot::Sender<Option<String>>),
+    AskAddress(oneshot::Sender<Option<String>>),
     Side,
     Info,
 }
@@ -231,6 +263,7 @@ enum Wake {
     Run(u64, RunEvent),
     Exit(Result<anyhow::Result<RunExit>, JoinError>),
     Pair(u64, PairProgress),
+    Restart,
     Stop,
 }
 
@@ -249,11 +282,40 @@ struct Controller {
     pair_tx: mpsc::UnboundedSender<(u64, PairProgress)>,
     dialog: Option<(u32, Purpose)>,
     next_dialog: u32,
+    detail: Option<String>,
+    /// When sharing restarts after an error, and the pause after the next.
+    restart_at: Option<tokio::time::Instant>,
+    restart_delay: Duration,
     quit: bool,
 }
 
 async fn cancelled(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|c| *c).await;
+}
+
+async fn sleep_until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Waits for `task` up to [`STOP_WAIT`], then aborts it (a stuck task must
+/// not keep the ports and the input hooks).
+async fn finish<T>(task: JoinHandle<T>, what: &str) -> Option<T> {
+    let abort = task.abort_handle();
+    match tokio::time::timeout(STOP_WAIT, task).await {
+        Ok(Ok(v)) => Some(v),
+        Ok(Err(e)) => {
+            warn!(error = %e, "{what} failed");
+            None
+        }
+        Err(_) => {
+            warn!("{what} did not stop in time");
+            abort.abort();
+            None
+        }
+    }
 }
 
 async fn sharing_done(s: &mut Option<Sharing>) -> Result<anyhow::Result<RunExit>, JoinError> {
@@ -289,8 +351,12 @@ pub async fn run_tray(
         pair_tx,
         dialog: None,
         next_dialog: 0,
+        detail: None,
+        restart_at: None,
+        restart_delay: Duration::ZERO,
         quit: false,
     };
+    c.restart_delay = c.restart_min();
     c.refresh_autostart();
     c.start_sharing();
     c.render();
@@ -300,6 +366,7 @@ pub async fn run_tray(
             Some((g, e)) = run_rx.recv() => Wake::Run(g, e),
             r = sharing_done(&mut c.sharing) => Wake::Exit(r),
             Some((g, p)) = pair_rx.recv() => Wake::Pair(g, p),
+            () = sleep_until(c.restart_at) => Wake::Restart,
             () = cancelled(&mut stop) => Wake::Stop,
         };
         match wake {
@@ -308,6 +375,13 @@ pub async fn run_tray(
             Wake::Run(g, e) => c.on_run(g, e),
             Wake::Exit(r) => c.on_run_exit(r),
             Wake::Pair(g, p) => c.on_pairing(g, p).await,
+            Wake::Restart => {
+                c.restart_at = None;
+                if matches!(c.status, Status::Error(_)) {
+                    info!("restarting sharing after an error");
+                    c.start_sharing();
+                }
+            }
         }
         c.render();
     }
@@ -323,7 +397,24 @@ impl Controller {
             peer: self.config.peer.as_ref().map(|p| (p.name.clone(), p.side)),
             clipboard: self.config.clipboard.enabled,
             autostart: self.autostart,
+            detail: self.detail.clone(),
         }
+    }
+
+    fn restart_min(&self) -> Duration {
+        self.env.retry.map_or(RESTART_MIN, |(min, _, _)| min)
+    }
+
+    fn restart_max(&self) -> Duration {
+        self.env.retry.map_or(RESTART_MAX, |(_, max, _)| max)
+    }
+
+    /// Sets an error status and schedules a restart with a growing pause.
+    fn failed(&mut self, error: String) {
+        error!(error = %error, "sharing failed");
+        self.status = Status::Error(error);
+        self.restart_at = Some(tokio::time::Instant::now() + self.restart_delay);
+        self.restart_delay = (self.restart_delay * 2).min(self.restart_max());
     }
 
     fn render(&mut self) {
@@ -386,11 +477,13 @@ impl Controller {
         if self.sharing.is_some() || self.pairing.is_some() {
             return;
         }
+        self.restart_at = None;
+        self.detail = None;
         self.reload();
         let discovery = match self.discovery() {
             Ok(d) => d,
             Err(e) => {
-                self.status = Status::Error(error_chain(&e));
+                self.failed(error_chain(&e));
                 return;
             }
         };
@@ -440,10 +533,8 @@ impl Controller {
             return;
         };
         let _ = s.stop.send(true);
-        match tokio::time::timeout(STOP_WAIT, s.task).await {
-            Ok(Ok(Err(e))) => warn!(error = %error_chain(&e), "the run loop failed"),
-            Ok(_) => {}
-            Err(_) => warn!("sharing did not stop in time"),
+        if let Some(Err(e)) = finish(s.task, "sharing").await {
+            warn!(error = %error_chain(&e), "the run loop failed");
         }
         info!("sharing stopped");
     }
@@ -493,7 +584,9 @@ impl Controller {
                 if self.sharing.is_some() {
                     self.stop_sharing().await;
                     self.status = Status::Paused;
+                    self.restart_at = None;
                 } else {
+                    self.restart_delay = self.restart_min();
                     self.start_sharing();
                 }
             }
@@ -520,7 +613,7 @@ impl Controller {
                 if self.pairing.is_some() {
                     self.cancel_pairing().await;
                 } else {
-                    self.start_pairing().await;
+                    self.start_pairing(PairMode::Search).await;
                 }
             }
             TrayEvent::Clicked(AUTOSTART) => self.toggle_autostart(),
@@ -534,8 +627,12 @@ impl Controller {
                     return;
                 };
                 match purpose {
+                    // "Pair by address...": dial the machine instead of waiting.
+                    Purpose::Code if button == Some(1) => {
+                        self.start_pairing(PairMode::Address).await
+                    }
                     Purpose::Code => self.cancel_pairing().await,
-                    Purpose::AskCode(reply) => {
+                    Purpose::AskCode(reply) | Purpose::AskAddress(reply) => {
                         let _ = reply.send((button == Some(1)).then(|| text.trim().to_string()));
                     }
                     Purpose::Side => {
@@ -573,14 +670,22 @@ impl Controller {
             return;
         }
         match e {
-            RunEvent::Connected { name, .. } => {
-                info!(peer = %name, "connected");
+            RunEvent::Connected { name, remote } => {
+                info!(peer = %name, %remote, "connected");
                 self.status = Status::Connected;
+                self.detail = None;
+                self.restart_delay = self.restart_min();
             }
-            RunEvent::Listening(_)
-            | RunEvent::Dialing(_)
-            | RunEvent::Retrying { .. }
-            | RunEvent::Ended(_) => self.status = Status::Waiting,
+            RunEvent::Retrying { error, .. } => {
+                info!(error = %error, "a connection attempt failed");
+                self.status = Status::Waiting;
+                self.detail = Some(error);
+            }
+            RunEvent::Ended(reason) => {
+                info!(?reason, "session ended");
+                self.status = Status::Waiting;
+            }
+            RunEvent::Listening(_) | RunEvent::Dialing(_) => self.status = Status::Waiting,
             RunEvent::Moved(addr) => {
                 if let Some(p) = &self.config.peer {
                     match Config::save_moved_peer(&self.env.config_dir, &p.fingerprint, addr) {
@@ -599,19 +704,30 @@ impl Controller {
 
     fn on_run_exit(&mut self, r: Result<anyhow::Result<RunExit>, JoinError>) {
         self.sharing = None;
-        self.status = match r {
-            Ok(Ok(RunExit::Stopped)) => Status::Paused,
-            Ok(Ok(RunExit::EmergencyStop)) => Status::EmergencyStop,
-            Ok(Err(e)) => {
-                error!(error = %error_chain(&e), "sharing failed");
-                Status::Error(error_chain(&e))
-            }
-            Err(e) => Status::Error(format!("internal error: {e}")),
-        };
+        match r {
+            Ok(Ok(RunExit::Stopped)) => self.status = Status::Paused,
+            Ok(Ok(RunExit::EmergencyStop)) => self.status = Status::EmergencyStop,
+            Ok(Err(e)) => self.failed(error_chain(&e)),
+            Err(e) => self.failed(format!("internal error: {e}")),
+        }
     }
 
-    async fn start_pairing(&mut self) {
-        let resume = !matches!(self.status, Status::Paused | Status::EmergencyStop);
+    /// Stops a pairing task (aborting it after [`STOP_WAIT`]).
+    async fn stop_pairing(&mut self) -> Option<Pairing> {
+        let mut p = self.pairing.take()?;
+        let _ = p.cancel.send(true);
+        let task = std::mem::replace(&mut p.task, tokio::spawn(async {}));
+        finish(task, "pairing").await;
+        Some(p)
+    }
+
+    async fn start_pairing(&mut self, mode: PairMode) {
+        // Switching to "by address" keeps the first attempt's resume flag.
+        let resume = match self.stop_pairing().await {
+            Some(old) => old.resume,
+            None => !matches!(self.status, Status::Paused | Status::EmergencyStop),
+        };
+        self.restart_at = None;
         self.stop_sharing().await;
         self.close_dialog();
         self.reload();
@@ -629,6 +745,7 @@ impl Controller {
             peer_side: None,
         };
         let task = tokio::spawn(pairing_task(
+            mode,
             self.env.identity.clone(),
             info,
             self.config.listen,
@@ -649,13 +766,9 @@ impl Controller {
 
     /// Ends pairing; sharing starts again when it ran before.
     async fn cancel_pairing(&mut self) {
-        let Some(p) = self.pairing.take() else {
+        let Some(p) = self.stop_pairing().await else {
             return;
         };
-        let _ = p.cancel.send(true);
-        if tokio::time::timeout(STOP_WAIT, p.task).await.is_err() {
-            warn!("pairing did not stop in time");
-        }
         self.close_dialog();
         self.after_pairing(p.resume);
     }
@@ -676,18 +789,39 @@ impl Controller {
             return;
         }
         match p {
-            PairProgress::Code(code) => self.open(
+            PairProgress::Code {
+                code,
+                address,
+                note,
+            } => {
+                let address = address.unwrap_or_else(|| "this computer's IP address".into());
+                let note = note.map(|n| format!("\n\n{n}")).unwrap_or_default();
+                self.open(
+                    Dialog {
+                        message: format!(
+                            "Enter this code on the other computer:\n\n{code}\n\nThere, \
+                             choose \u{201c}Pair with the other computer\u{2026}\u{201d} in \
+                             the MacWin menu. If it does not find this computer, click \
+                             \u{201c}Pair by address\u{2026}\u{201d} in its window and enter \
+                             {address}.{note}"
+                        ),
+                        input: false,
+                        buttons: vec!["Cancel".into(), "Pair by address\u{2026}".into()],
+                    },
+                    Purpose::Code,
+                )
+            }
+            PairProgress::AskAddress { note, reply } => self.open(
                 Dialog {
                     message: format!(
-                        "Enter this code on the other computer:\n\n{code}\n\nThere, choose \
-                         \u{201c}Pair with the other computer\u{2026}\u{201d} in the MacWin \
-                         menu, or run: macwin pair --code {}",
-                        code.digits()
+                        "{}Enter the address shown in the other computer's pairing window \
+                         (for example 192.168.1.20:47800):",
+                        note.map(|n| format!("{n}\n\n")).unwrap_or_default()
                     ),
-                    input: false,
-                    buttons: vec!["Cancel".into()],
+                    input: true,
+                    buttons: vec!["Cancel".into(), "Next".into()],
                 },
-                Purpose::Code,
+                Purpose::AskAddress(reply),
             ),
             PairProgress::Ask { name, note, reply } => self.open(
                 Dialog {
@@ -746,18 +880,17 @@ impl Controller {
     }
 
     async fn shutdown(&mut self) {
-        if let Some(p) = self.pairing.take() {
-            let _ = p.cancel.send(true);
-            let _ = tokio::time::timeout(STOP_WAIT, p.task).await;
-        }
+        self.stop_pairing().await;
         self.close_dialog();
         self.stop_sharing().await;
     }
 }
 
 /// Pairs with the machine that waits for pairing, or waits and shows a
-/// code when there is none; reports through `report`.
+/// code when there is none (or dials an address the user enters); reports
+/// through `report`.
 async fn pairing_task(
+    mode: PairMode,
     id: Identity,
     info: PairInfo,
     listen: SocketAddr,
@@ -765,11 +898,102 @@ async fn pairing_task(
     report: impl Fn(PairProgress) + Send + 'static,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let result = pair_flow(&id, &info, listen, discovery.as_ref(), &report, &mut cancel).await;
+    let result = match mode {
+        PairMode::Search => {
+            pair_flow(&id, &info, listen, discovery.as_ref(), &report, &mut cancel).await
+        }
+        PairMode::Address => pair_by_address(&id, &info, &report, &mut cancel).await,
+    };
     if let Err(e) = &result {
         info!(error = %error_chain(e), "pairing ended");
     }
     report(PairProgress::Done(result));
+}
+
+/// Asks the user for a line of text; `None` when cancelled.
+async fn ask(
+    report: &impl Fn(PairProgress),
+    cancel: &mut watch::Receiver<bool>,
+    progress: impl FnOnce(oneshot::Sender<Option<String>>) -> PairProgress,
+) -> Option<String> {
+    let (reply, answer) = oneshot::channel();
+    report(progress(reply));
+    tokio::select! {
+        r = answer => r.ok().flatten(),
+        () = cancelled(cancel) => None,
+    }
+}
+
+/// Asks for the code shown on `name` (at `addr`) until one works.
+async fn dial_with_codes(
+    id: &Identity,
+    info: &PairInfo,
+    addr: SocketAddr,
+    name: &str,
+    report: &impl Fn(PairProgress),
+    cancel: &mut watch::Receiver<bool>,
+) -> anyhow::Result<PairedPeer> {
+    let mut note = None;
+    for attempt in 1..=MAX_PAIR_ATTEMPTS {
+        let asked = ask(report, cancel, |reply| PairProgress::Ask {
+            name: name.to_string(),
+            note,
+            reply,
+        })
+        .await;
+        let Some(text) = asked else {
+            bail!(CANCELLED);
+        };
+        let Ok(code) = PairingCode::parse(&text) else {
+            note = Some("That was not a 6-digit code.");
+            continue;
+        };
+        let result = tokio::select! {
+            r = macwin_net::pair_connect(bind_for(addr), addr, id, &code, info) => r,
+            () = cancelled(cancel) => bail!(CANCELLED),
+        };
+        match result {
+            Ok(peer) => return Ok(peer),
+            Err(NetError::PairingFailed(why)) if attempt < MAX_PAIR_ATTEMPTS => {
+                info!(why, "the code did not work");
+                note = Some("That code did not work. The other computer shows a new one.");
+            }
+            Err(e) => return Err(e).with_context(|| format!("pairing with {addr} failed")),
+        }
+    }
+    bail!("too many wrong codes; start pairing again")
+}
+
+/// Pairs with the machine at an address the user enters (no broadcast
+/// needed: the address is shown in the other machine's code window).
+async fn pair_by_address(
+    id: &Identity,
+    info: &PairInfo,
+    report: &impl Fn(PairProgress),
+    cancel: &mut watch::Receiver<bool>,
+) -> anyhow::Result<(PairedPeer, Option<String>)> {
+    let mut note = None;
+    for _ in 0..MAX_PAIR_ATTEMPTS {
+        let asked = ask(report, cancel, |reply| PairProgress::AskAddress {
+            note,
+            reply,
+        })
+        .await;
+        let Some(text) = asked else {
+            bail!(CANCELLED);
+        };
+        let Ok(target) = normalize_address(&text) else {
+            note = Some("That is not an address like 192.168.1.20:47800.");
+            continue;
+        };
+        let Ok(addr) = resolve(&target).await else {
+            note = Some("That address cannot be found.");
+            continue;
+        };
+        let peer = dial_with_codes(id, info, addr, &target, report, cancel).await?;
+        return Ok((peer, Some(target)));
+    }
+    bail!("no usable address; start pairing again")
 }
 
 async fn pair_flow(
@@ -780,10 +1004,15 @@ async fn pair_flow(
     report: &impl Fn(PairProgress),
     cancel: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<(PairedPeer, Option<String>)> {
+    let mut note = match discovery {
+        None => Some("LAN discovery is off on this computer.".to_string()),
+        Some(_) => None,
+    };
     let found = match discovery {
         Some(d) => tokio::select! {
             r = d.find_pairing() => r.unwrap_or_else(|e| {
                 warn!(error = %error_chain(&e), "LAN search failed");
+                note = Some(error_chain(&e));
                 Vec::new()
             }),
             () = cancelled(cancel) => bail!(CANCELLED),
@@ -795,11 +1024,26 @@ async fn pair_flow(
             let listener = runner::bind_retrying(|| macwin_net::pair_listen(listen, id))
                 .await
                 .with_context(|| format!("cannot listen on {listen}"))?;
-            let responder = announce_pairing(discovery, listener.local_addr()?.port(), info).await;
+            let local = listener.local_addr()?;
+            let responder = announce_pairing(discovery, local.port(), info).await;
+            if discovery.is_some() && responder.is_none() {
+                note = Some(format!(
+                    "This computer cannot answer LAN searches (UDP port {} is in use).",
+                    macwin_net::discovery::DISCOVERY_PORT
+                ));
+            }
+            let address =
+                reachable_ip(local).map(|ip| SocketAddr::new(ip, local.port()).to_string());
             let result = wait_for_pairing(
                 &listener,
                 info,
-                |code| report(PairProgress::Code(code.clone())),
+                |code| {
+                    report(PairProgress::Code {
+                        code: code.clone(),
+                        address: address.clone(),
+                        note: note.clone(),
+                    })
+                },
                 |why| info!(why, "a pairing attempt failed"),
                 cancelled(cancel),
             )
@@ -812,66 +1056,40 @@ async fn pair_flow(
             }
         }
         [f] => {
-            let mut note = None;
-            for attempt in 1..=MAX_PAIR_ATTEMPTS {
-                let (reply, answer) = oneshot::channel();
-                report(PairProgress::Ask {
-                    name: f.device_name.clone(),
-                    note,
-                    reply,
-                });
-                let text = tokio::select! {
-                    r = answer => r.ok().flatten(),
-                    () = cancelled(cancel) => None,
-                };
-                let Some(text) = text else {
-                    bail!(CANCELLED);
-                };
-                let Ok(code) = PairingCode::parse(&text) else {
-                    note = Some("That was not a 6-digit code.");
-                    continue;
-                };
-                let attempt_result = tokio::select! {
-                    r = macwin_net::pair_connect(bind_for(f.addr), f.addr, id, &code, info) => r,
-                    () = cancelled(cancel) => bail!(CANCELLED),
-                };
-                match attempt_result {
-                    Ok(peer) => return Ok((peer, Some(f.addr.to_string()))),
-                    Err(NetError::PairingFailed(why)) if attempt < MAX_PAIR_ATTEMPTS => {
-                        info!(why, "the code did not work");
-                        note = Some("That code did not work. The other computer shows a new one.");
-                    }
-                    Err(e) => {
-                        return Err(e).with_context(|| format!("pairing with {} failed", f.addr));
-                    }
-                }
-            }
-            bail!("too many wrong codes; start pairing again")
+            let peer = dial_with_codes(id, info, f.addr, &f.device_name, report, cancel).await?;
+            Ok((peer, Some(f.addr.to_string())))
         }
         many => {
             let names: Vec<String> = many.iter().map(|f| quoted(&f.device_name)).collect();
             bail!(
-                "several computers wait for pairing ({}); pair from a terminal: macwin pair \
-                 HOST --code CODE",
+                "several computers wait for pairing ({}); click \u{201c}Pair by \
+                 address\u{2026}\u{201d} on one of them instead",
                 names.join(", ")
             )
         }
     }
 }
 
+/// Ctrl+C, or SIGTERM (launchd, logout) on macOS. A handler that cannot be
+/// installed never fires.
 async fn wait_for_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         if let Ok(mut term) = signal(SignalKind::terminate()) {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
+                () = ctrl_c => {}
                 _ = term.recv() => {}
             }
             return;
         }
     }
-    let _ = tokio::signal::ctrl_c().await;
+    ctrl_c.await;
 }
 
 /// `macwin tray`, `macwin-tray.exe` and MacWin.app opened without arguments.
@@ -897,8 +1115,8 @@ fn run_app() -> anyhow::Result<()> {
     let os = host_os().context("unsupported OS: macwin runs on macOS and Windows")?;
     platform::init();
     let runtime = tokio::runtime::Runtime::new().context("cannot start the async runtime")?;
-    let id = crate::commands::load_identity()?;
-    let _lock = match instance::lock(&id.config_dir) {
+    let config_dir = macwin_net::config_dir(|k| std::env::var_os(k))?;
+    let _lock = match instance::lock(&config_dir) {
         Ok(l) => l,
         Err(e) if e.is::<AlreadyRunning>() => {
             info!("another MacWin is running");
@@ -909,6 +1127,7 @@ fn run_app() -> anyhow::Result<()> {
         }
         Err(e) => return Err(e),
     };
+    let id = crate::commands::load_identity()?;
     let staging = macwin_net::cache_dir(|k| std::env::var_os(k))?.join("incoming");
     let env = TrayEnv {
         config_dir: id.config_dir.clone(),
@@ -955,6 +1174,7 @@ mod tests {
             peer: peer.map(|(n, s)| (n.to_string(), s)),
             clipboard: true,
             autostart: Some(false),
+            detail: None,
         }
     }
 

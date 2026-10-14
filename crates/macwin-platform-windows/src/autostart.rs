@@ -98,9 +98,14 @@ pub fn delete_run_value(name: &str) -> Result<(), PlatformError> {
 mod tests {
     use super::*;
 
-    /// Uses a value name of its own and removes it again.
+    /// Writes the real `Run` key (a value of its own, removed again), so it
+    /// runs only in CI.
     #[test]
     fn run_values_round_trip() {
+        if std::env::var_os("CI").is_none() {
+            eprintln!("skipped outside CI: it writes HKCU\\...\\Run");
+            return;
+        }
         let name = format!("macwin-test-{}", std::process::id());
         assert_eq!(run_value(&name).unwrap(), None);
         set_run_value(&name, "\"C:\\Program Files\\x.exe\" --flag").unwrap();

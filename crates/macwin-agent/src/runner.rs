@@ -77,8 +77,8 @@ pub enum RunEvent {
         after: Duration,
         error: String,
     },
-    /// The peer answered a LAN search at this new address, and the session
-    /// to it succeeded (the caller may remember the address).
+    /// The peer answered a LAN search at this address (not the configured
+    /// one), and the session to it succeeded: the caller may remember it.
     Moved(SocketAddr),
 }
 
@@ -186,6 +186,10 @@ pub async fn run(
     // configured one, and the last one reported as `Moved`.
     let mut found: Option<SocketAddr> = None;
     let mut reported: Option<SocketAddr> = None;
+    let configured: Option<SocketAddr> = match &opts.mode {
+        Mode::Dial(target) => target.parse().ok(),
+        Mode::Listen(_) => None,
+    };
     let retry_min = opts.retry_min.min(opts.retry_max);
     let mut backoff = retry_min;
     loop {
@@ -198,6 +202,8 @@ pub async fn run(
             .screens()
             .context("cannot read the screens")?;
         let hello = kvm_hello(&opts.session, screens);
+        // The address a dial attempt went to, once resolved.
+        let mut attempted: Option<SocketAddr> = None;
         let attempt: Result<(Session, TransportRole), anyhow::Error> = match (&opts.mode, &listener)
         {
             (Mode::Listen(_), Some(l)) => tokio::select! {
@@ -219,6 +225,7 @@ pub async fn run(
                         Some(addr) => addr,
                         None => resolve(target).await?,
                     };
+                    attempted = Some(remote);
                     let s = tokio::time::timeout(
                         opts.connect_timeout,
                         connect(bind_for(remote), remote, &id, opts.peer, &hello),
@@ -246,8 +253,11 @@ pub async fn run(
                         error,
                     }),
                     Mode::Dial(_) => {
+                        found = None;
                         if let Some(d) = &opts.discovery {
-                            // The peer may have a new address: ask the LAN.
+                            // The peer may have a new address: ask the LAN,
+                            // and try an answer other than the address that
+                            // just failed (answers can be forged).
                             let targets = d.targets();
                             let search = find_peer(&targets, opts.peer, FIND_TIME);
                             let result = tokio::select! {
@@ -255,15 +265,19 @@ pub async fn run(
                                 () = stopped(&mut stop) => return Ok(RunExit::Stopped),
                             };
                             match result {
-                                Ok(Some(addr)) if found != Some(addr) => {
-                                    info!(%addr, error = %error, "the peer answered a LAN search");
-                                    found = Some(addr);
-                                    backoff = retry_min;
-                                    continue;
+                                Ok(answers) => {
+                                    found = answers.into_iter().find(|a| Some(*a) != attempted);
                                 }
-                                Ok(Some(_)) => {}
-                                Ok(None) => found = None,
                                 Err(e) => debug!(error = %e, "LAN search failed"),
+                            }
+                            if let Some(addr) = found {
+                                info!(%addr, error = %error, "the peer answered a LAN search");
+                                // A short pause all the same: forged answers
+                                // must not turn this into a busy loop.
+                                if sleep_or_stop(retry_min, &mut stop).await {
+                                    return Ok(RunExit::Stopped);
+                                }
+                                continue;
                             }
                         }
                         on_event(RunEvent::Retrying {
@@ -284,7 +298,7 @@ pub async fn run(
             name: session.peer.device_name.clone(),
             remote: session.remote,
         });
-        if let Some(addr) = found.filter(|a| reported != Some(*a)) {
+        if let Some(addr) = found.filter(|a| reported != Some(*a) && configured != Some(*a)) {
             reported = Some(addr);
             on_event(RunEvent::Moved(addr));
         }

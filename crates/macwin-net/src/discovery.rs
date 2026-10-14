@@ -271,6 +271,16 @@ async fn search(
     }
 }
 
+/// A remote device name for terminals and dialogs: control characters
+/// (escape sequences, line breaks, NUL) become spaces.
+fn clean_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// The machines waiting for pairing that answer within `wait`.
 pub async fn find_pairing(targets: &[SocketAddr], wait: Duration) -> Result<Vec<Found>, NetError> {
     let query = DiscoveryQuery {
@@ -285,7 +295,7 @@ pub async fn find_pairing(targets: &[SocketAddr], wait: Duration) -> Result<Vec<
                 found.push(Found {
                     addr,
                     os,
-                    device_name,
+                    device_name: clean_name(&device_name),
                 });
             }
         }
@@ -295,13 +305,15 @@ pub async fn find_pairing(targets: &[SocketAddr], wait: Duration) -> Result<Vec<
     Ok(found)
 }
 
-/// The session listener of the machine presenting `peer`, if it answers
-/// within `wait` (returns at the first answer).
+/// The session listeners that answer within `wait` for the machine
+/// presenting `peer`. Every distinct answer is kept: fingerprints are not
+/// secret (any LAN host can fetch the certificate), so an answer can be
+/// forged, and the caller tries each address in turn.
 pub async fn find_peer(
     targets: &[SocketAddr],
     peer: Fingerprint,
     wait: Duration,
-) -> Result<Option<SocketAddr>, NetError> {
+) -> Result<Vec<SocketAddr>, NetError> {
     let nonce = nonce()?;
     let query = DiscoveryQuery {
         nonce,
@@ -310,13 +322,15 @@ pub async fn find_peer(
         },
     };
     let proof = peer_proof(&nonce, &peer);
-    let mut found = None;
-    search(targets, &query, wait, |from, a| match a.offer {
-        DiscoveryOffer::Peer { proof: p } if p == proof => {
-            found = Some(SocketAddr::new(from.ip(), a.port));
-            true
+    let mut found = Vec::new();
+    search(targets, &query, wait, |from, a| {
+        let addr = SocketAddr::new(from.ip(), a.port);
+        if matches!(a.offer, DiscoveryOffer::Peer { proof: p } if p == proof)
+            && !found.contains(&addr)
+        {
+            found.push(addr);
         }
-        _ => false,
+        false
     })
     .await?;
     Ok(found)
@@ -388,6 +402,12 @@ mod tests {
         for ip in ["8.8.8.8", "100.64.0.1", "2001:db8::1", "::ffff:1.1.1.1"] {
             assert!(!is_lan(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[test]
+    fn remote_names_lose_control_characters() {
+        assert_eq!(clean_name("PC\u{1b}[31m\nred\0"), "PC [31m red");
+        assert_eq!(clean_name("  Dmitriy's MacBook  "), "Dmitriy's MacBook");
     }
 
     #[test]

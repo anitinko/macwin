@@ -60,15 +60,10 @@ async fn a_search_finds_the_peer_by_fingerprint_only() {
     )
     .await
     .unwrap();
-    let start = Instant::now();
-    let found = find_peer(&[r.local_addr()], fp, Duration::from_secs(5))
+    let found = find_peer(&[r.local_addr()], fp, Duration::from_millis(500))
         .await
         .unwrap();
-    assert_eq!(found, Some("127.0.0.1:50123".parse().unwrap()));
-    assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "returns at the first answer"
-    );
+    assert_eq!(found, vec!["127.0.0.1:50123".parse().unwrap()]);
     let other = find_peer(
         &[r.local_addr()],
         Fingerprint([8; 32]),
@@ -76,15 +71,62 @@ async fn a_search_finds_the_peer_by_fingerprint_only() {
     )
     .await
     .unwrap();
-    assert_eq!(other, None);
+    assert!(other.is_empty());
     // Once dropped, the responder is silent.
     let addr = r.local_addr();
     drop(r);
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(
+    assert!(
         find_peer(&[addr], fp, Duration::from_millis(300))
             .await
-            .unwrap(),
-        None
+            .unwrap()
+            .is_empty()
     );
+}
+
+/// Anyone who fetched the certificate can answer for the peer: a search
+/// reports every distinct answer, and garbage does not stop a responder.
+#[tokio::test]
+async fn every_answer_is_reported_and_garbage_is_ignored() {
+    let fp = Fingerprint([9; 32]);
+    let real = Responder::start(
+        loopback(),
+        Offer::Peer {
+            port: 47800,
+            fingerprint: fp,
+        },
+    )
+    .await
+    .unwrap();
+    let forged = Responder::start(
+        loopback(),
+        Offer::Peer {
+            port: 9,
+            fingerprint: fp,
+        },
+    )
+    .await
+    .unwrap();
+    let junk = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for bytes in [&b"MWD1\xff\xff"[..], b"hello", &[0u8; 600][..]] {
+        junk.send_to(bytes, real.local_addr()).unwrap();
+    }
+    let start = Instant::now();
+    let mut found = find_peer(
+        &[real.local_addr(), forged.local_addr()],
+        fp,
+        Duration::from_millis(400),
+    )
+    .await
+    .unwrap();
+    assert!(
+        start.elapsed() >= Duration::from_millis(400),
+        "collects for the whole wait"
+    );
+    found.sort();
+    let want: Vec<SocketAddr> = vec![
+        "127.0.0.1:9".parse().unwrap(),
+        "127.0.0.1:47800".parse().unwrap(),
+    ];
+    assert_eq!(found, want);
 }

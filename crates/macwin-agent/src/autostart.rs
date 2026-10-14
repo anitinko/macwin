@@ -108,6 +108,15 @@ impl Autostart for LaunchAgent {
     }
 
     fn enable(&self) -> anyhow::Result<()> {
+        let exe = &self.program[0];
+        // A copy on a disk image, or one macOS moved to a random read-only
+        // place (App Translocation, for downloaded apps that were never
+        // moved), is gone after the next login.
+        if exe.starts_with("/Volumes/") || exe.contains("/AppTranslocation/") {
+            anyhow::bail!(
+                "MacWin runs from a disk image or a temporary location ({exe}); move MacWin.app                  to the Applications folder, open it from there and try again"
+            );
+        }
         for dir in [self.plist.parent(), self.log.parent()]
             .into_iter()
             .flatten()
@@ -213,6 +222,9 @@ mod tests {
         LaunchAgent::new(home, Path::new("/Apps/Mac & Win.app/Contents/MacOS/macwin"))
     }
 
+    /// LaunchAgents exist on macOS only (on Windows the paths print with
+    /// `\` and differ from the expected text).
+    #[cfg(unix)]
     #[test]
     fn the_launch_agent_starts_the_tray_app() {
         let a = agent(Path::new("/Users/me"));
@@ -253,6 +265,20 @@ mod tests {
         a.disable().unwrap();
         a.disable().unwrap();
         assert_eq!(other.state().unwrap(), State::Off);
+    }
+
+    #[test]
+    fn copies_that_will_disappear_are_refused() {
+        let home = tempfile::tempdir().unwrap();
+        for exe in [
+            "/Volumes/MacWin 0.1.0/MacWin.app/Contents/MacOS/macwin",
+            "/private/var/folders/x/T/AppTranslocation/1234/d/MacWin.app/Contents/MacOS/macwin",
+        ] {
+            let a = LaunchAgent::new(home.path(), Path::new(exe));
+            let err = a.enable().unwrap_err().to_string();
+            assert!(err.contains("Applications"), "{err}");
+            assert_eq!(a.state().unwrap(), State::Off);
+        }
     }
 
     /// The plist is valid for macOS itself.

@@ -743,5 +743,127 @@ proptest! {
         let _ = decode_datagram(&bytes);
         let _ = decode_clipboard(&bytes);
         let _ = decode_pair(&bytes);
+        let _ = decode_discovery(&bytes);
+        // Discovery datagrams come from anyone on the LAN.
+        let mut magic = DISCOVERY_MAGIC.to_vec();
+        magic.extend_from_slice(&bytes);
+        let _ = decode_discovery(&magic);
     }
+}
+
+fn discovery_query() -> macwin_core::msg::DiscoveryMsg {
+    use macwin_core::msg::{DiscoveryMsg, DiscoveryQuery, DiscoveryWant};
+    DiscoveryMsg::Query(DiscoveryQuery {
+        nonce: [7; 16],
+        want: DiscoveryWant::Peer { tag: [9; 32] },
+    })
+}
+
+#[test]
+fn discovery_round_trips_and_checks_its_envelope() {
+    use macwin_core::msg::{DiscoveryAnswer, DiscoveryMsg, DiscoveryOffer};
+    let answers = [
+        DiscoveryOffer::Pairing {
+            os: Os::Windows,
+            device_name: "DESKTOP-1".into(),
+        },
+        DiscoveryOffer::Peer { proof: [3; 32] },
+    ]
+    .map(|offer| {
+        DiscoveryMsg::Answer(DiscoveryAnswer {
+            nonce: [1; 16],
+            protocol_version: PROTOCOL_VERSION,
+            port: 47800,
+            offer,
+        })
+    });
+    for m in answers.into_iter().chain([discovery_query()]) {
+        let bytes = encode_discovery(&m);
+        assert!(bytes.starts_with(&DISCOVERY_MAGIC) && bytes.len() <= MAX_DISCOVERY_LEN);
+        assert_eq!(decode_discovery(&bytes).unwrap(), m);
+    }
+    let mut bytes = encode_discovery(&discovery_query());
+    bytes[0] = b'X';
+    assert_invalid_value(decode_discovery(&bytes), "discovery datagram");
+    let mut long = encode_discovery(&discovery_query());
+    long.resize(MAX_DISCOVERY_LEN + 1, 0);
+    assert_invalid_value(decode_discovery(&long), "discovery datagram");
+    assert!(decode_discovery(b"MWD1\xff\xff").is_err());
+}
+
+#[test]
+fn discovery_fields_are_validated() {
+    use crate::wire::{discovery_answer, discovery_frame, discovery_query};
+    let frame = |kind| {
+        let mut out = DISCOVERY_MAGIC.to_vec();
+        wire::DiscoveryFrame { kind: Some(kind) }
+            .encode(&mut out)
+            .unwrap();
+        out
+    };
+    let query = |nonce: Vec<u8>, want| {
+        frame(discovery_frame::Kind::Query(wire::DiscoveryQuery {
+            nonce,
+            want,
+        }))
+    };
+    let pairing = Some(discovery_query::Want::Pairing(
+        wire::DiscoveryWantPairing {},
+    ));
+    assert!(decode_discovery(&query(vec![0; 16], pairing.clone())).is_ok());
+    assert_invalid_value(
+        decode_discovery(&query(vec![0; 15], pairing)),
+        "discovery_query.nonce",
+    );
+    assert!(matches!(
+        decode_discovery(&query(vec![0; 16], None)),
+        Err(ProtoError::UnknownKind(_))
+    ));
+    let short_tag = Some(discovery_query::Want::Peer(wire::DiscoveryWantPeer {
+        tag: vec![0; 31],
+    }));
+    assert_invalid_value(
+        decode_discovery(&query(vec![0; 16], short_tag)),
+        "discovery_query.peer.tag",
+    );
+    let answer = |port: u32, offer| {
+        frame(discovery_frame::Kind::Answer(wire::DiscoveryAnswer {
+            nonce: vec![0; 16],
+            protocol_version: PROTOCOL_VERSION,
+            port,
+            offer,
+        }))
+    };
+    let pairing = |os: i32, device_name: String| {
+        Some(discovery_answer::Offer::Pairing(wire::DiscoveryPairing {
+            os,
+            device_name,
+        }))
+    };
+    assert!(decode_discovery(&answer(47800, pairing(1, "mac".into()))).is_ok());
+    for port in [0, 65536] {
+        assert_invalid_value(
+            decode_discovery(&answer(port, pairing(1, "mac".into()))),
+            "discovery_answer.port",
+        );
+    }
+    assert_invalid_enum(
+        decode_discovery(&answer(47800, pairing(0, "mac".into()))),
+        "discovery_answer.pairing.os",
+    );
+    assert_invalid_value(
+        decode_discovery(&answer(47800, pairing(1, "x".repeat(257)))),
+        "discovery_answer.pairing.device_name",
+    );
+    let proof = Some(discovery_answer::Offer::Peer(wire::DiscoveryPeer {
+        proof: vec![0; 33],
+    }));
+    assert_invalid_value(
+        decode_discovery(&answer(47800, proof)),
+        "discovery_answer.peer.proof",
+    );
+    assert!(matches!(
+        decode_discovery(&answer(47800, None)),
+        Err(ProtoError::UnknownKind(_))
+    ));
 }

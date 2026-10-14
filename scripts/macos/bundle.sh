@@ -6,7 +6,8 @@
 #   MACWIN_SIGN_IDENTITY="Apple Development: Name (TEAMID)" scripts/macos/bundle.sh
 # Without it, the first "Apple Development" identity in the keychain is used,
 # and as a last resort an ad-hoc signature (permissions then reset on every
-# rebuild).
+# rebuild). MACWIN_PROFILE picks the Cargo profile (default `release`;
+# dmg.sh uses the stripped `dist`).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -24,11 +25,15 @@ if [[ -z "${RUSTUP_TOOLCHAIN:-}" ]] && command -v rustup >/dev/null; then
 fi
 
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
-cargo build --release -p macwin-agent
+PROFILE="${MACWIN_PROFILE:-release}"
+OUT="target/$PROFILE"
+[[ "$PROFILE" == dev ]] && OUT=target/debug
+cargo build --profile "$PROFILE" -p macwin-agent --bin macwin
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
-cp target/release/macwin "$APP/Contents/MacOS/macwin"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$OUT/macwin" "$APP/Contents/MacOS/macwin"
+cp THIRD_PARTY_NOTICES "$APP/Contents/Resources/THIRD_PARTY_NOTICES"
 sed "s/@VERSION@/$VERSION/g" scripts/macos/Info.plist.in >"$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 

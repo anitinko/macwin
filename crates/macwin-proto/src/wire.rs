@@ -187,6 +187,86 @@ pub struct PairConfirm {
 #[derive(Clone, Copy, PartialEq, Message)]
 pub struct PairDone {}
 
+/// One LAN discovery datagram (after [`crate::DISCOVERY_MAGIC`]).
+#[derive(Clone, PartialEq, Message)]
+pub struct DiscoveryFrame {
+    #[prost(oneof = "discovery_frame::Kind", tags = "1, 2")]
+    pub kind: Option<discovery_frame::Kind>,
+}
+
+pub mod discovery_frame {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Query(super::DiscoveryQuery),
+        #[prost(message, tag = "2")]
+        Answer(super::DiscoveryAnswer),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DiscoveryQuery {
+    #[prost(bytes = "vec", tag = "1")]
+    pub nonce: Vec<u8>,
+    #[prost(oneof = "discovery_query::Want", tags = "2, 3")]
+    pub want: Option<discovery_query::Want>,
+}
+
+pub mod discovery_query {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Want {
+        #[prost(message, tag = "2")]
+        Pairing(super::DiscoveryWantPairing),
+        #[prost(message, tag = "3")]
+        Peer(super::DiscoveryWantPeer),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct DiscoveryWantPairing {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DiscoveryWantPeer {
+    #[prost(bytes = "vec", tag = "1")]
+    pub tag: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DiscoveryAnswer {
+    #[prost(bytes = "vec", tag = "1")]
+    pub nonce: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    pub protocol_version: u32,
+    #[prost(uint32, tag = "3")]
+    pub port: u32,
+    #[prost(oneof = "discovery_answer::Offer", tags = "4, 5")]
+    pub offer: Option<discovery_answer::Offer>,
+}
+
+pub mod discovery_answer {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Offer {
+        #[prost(message, tag = "4")]
+        Pairing(super::DiscoveryPairing),
+        #[prost(message, tag = "5")]
+        Peer(super::DiscoveryPeer),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DiscoveryPairing {
+    #[prost(enumeration = "Os", tag = "1")]
+    pub os: i32,
+    #[prost(string, tag = "2")]
+    pub device_name: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DiscoveryPeer {
+    #[prost(bytes = "vec", tag = "1")]
+    pub proof: Vec<u8>,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct Hello {
     #[prost(uint32, tag = "1")]

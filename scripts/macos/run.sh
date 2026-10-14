@@ -6,8 +6,9 @@
 # here. Ctrl+C in this terminal stops the app gracefully.
 #
 #   scripts/macos/run.sh probe permissions --prompt
-#   scripts/macos/run.sh pair 192.168.1.20:47800 --code 123456
+#   scripts/macos/run.sh pair --code 123456
 #   scripts/macos/run.sh run
+#   scripts/macos/run.sh tray        # the menu bar app (also: open target/MacWin.app)
 #
 # There is no terminal input inside the app: pass the pairing code with --code.
 set -euo pipefail

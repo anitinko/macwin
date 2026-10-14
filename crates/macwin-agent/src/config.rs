@@ -36,6 +36,9 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Swap Ctrl and Cmd/Win when controlling the other OS.
     pub remap: bool,
+    /// Find machines on the LAN by UDP broadcast (pairing, and the peer
+    /// after its address changed) and answer such searches.
+    pub discovery: bool,
     pub clipboard: ClipboardConfig,
     pub peer: Option<PeerConfig>,
 }
@@ -80,6 +83,7 @@ impl Default for Config {
         Config {
             listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
             remap: true,
+            discovery: true,
             clipboard: ClipboardConfig {
                 enabled: true,
                 max_text_kb: DEFAULT_CLIPBOARD_MAX_KB,
@@ -97,6 +101,7 @@ impl Default for Config {
 struct RawConfig {
     listen: String,
     remap: bool,
+    discovery: bool,
     clipboard: RawClipboard,
     #[serde(skip_serializing_if = "Option::is_none")]
     peer: Option<RawPeer>,
@@ -219,6 +224,7 @@ impl From<&Config> for RawConfig {
         RawConfig {
             listen: c.listen.to_string(),
             remap: c.remap,
+            discovery: c.discovery,
             clipboard: RawClipboard {
                 enabled: c.clipboard.enabled,
                 max_text_kb: c.clipboard.max_text_kb,
@@ -271,6 +277,7 @@ impl TryFrom<RawConfig> for Config {
         Ok(Config {
             listen,
             remap: r.remap,
+            discovery: r.discovery,
             clipboard: ClipboardConfig {
                 enabled: r.clipboard.enabled,
                 max_text_kb: check_max_kb(r.clipboard.max_text_kb)?,
@@ -318,6 +325,37 @@ impl Config {
             .with_context(|| format!("cannot write {}", path.display()))
     }
 
+    /// Remembers that the peer `fingerprint` now answers at `addr` (found by
+    /// LAN discovery, after a pinned session to it succeeded). Only an IP
+    /// address is replaced: a host name is kept, it is meant to follow the
+    /// machine. Returns whether the config changed.
+    pub fn peer_moved(&mut self, fingerprint: &Fingerprint, addr: SocketAddr) -> bool {
+        let Some(peer) = self.peer.as_mut().filter(|p| &p.fingerprint == fingerprint) else {
+            return false;
+        };
+        match peer.address.as_deref().map(str::parse::<SocketAddr>) {
+            Some(Ok(old)) if old != addr => {
+                peer.address = Some(addr.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// [`Config::peer_moved`] on the file in `dir`; saves when it changed.
+    pub fn save_moved_peer(
+        dir: &Path,
+        fingerprint: &Fingerprint,
+        addr: SocketAddr,
+    ) -> anyhow::Result<bool> {
+        let mut config = Config::load(dir)?;
+        if !config.peer_moved(fingerprint, addr) {
+            return Ok(false);
+        }
+        config.save(dir)?;
+        Ok(true)
+    }
+
     fn peer_mut(&mut self) -> anyhow::Result<&mut PeerConfig> {
         self.peer
             .as_mut()
@@ -348,6 +386,7 @@ impl Config {
                     .map_err(|_| anyhow!("listen: expected ADDR:PORT, got {value:?}"))?;
             }
             "remap" => self.remap = parse_bool(key, value)?,
+            "discovery" => self.discovery = parse_bool(key, value)?,
             "clipboard" => self.clipboard.enabled = parse_bool(key, value)?,
             "clipboard-max-kb" => {
                 let kb = value
@@ -364,7 +403,7 @@ impl Config {
                 self.clipboard.max_files_mb = check_max_mb(mb)?;
             }
             _ => bail!(
-                "unknown key {key:?}; keys: side, address, listen, remap, clipboard, \
+                "unknown key {key:?}; keys: side, address, listen, remap, discovery, clipboard, \
                  clipboard-max-kb, clipboard-images, clipboard-files, clipboard-files-max-mb"
             ),
         }
@@ -490,6 +529,8 @@ mod tests {
         );
         c.set("listen", "0.0.0.0:5000").unwrap();
         c.set("remap", "off").unwrap();
+        c.set("discovery", "off").unwrap();
+        assert!(!c.discovery && Config::default().discovery);
         c.set("clipboard", "off").unwrap();
         c.set("clipboard-max-kb", "64").unwrap();
         assert_eq!(c.listen.port(), 5000);
@@ -513,5 +554,31 @@ mod tests {
         assert_eq!(peer.address.as_deref(), Some("pc.local:47800"));
         p.set("address", "none").unwrap();
         assert_eq!(p.peer.unwrap().address, None);
+    }
+
+    #[test]
+    fn a_moved_peer_replaces_only_ip_addresses() {
+        let addr: SocketAddr = "192.168.1.33:47800".parse().unwrap();
+        let mut c = paired();
+        let fp = c.peer.as_ref().unwrap().fingerprint;
+        assert!(!c.peer_moved(&Fingerprint([0; 32]), addr), "another peer");
+        assert!(c.peer_moved(&fp, addr));
+        assert_eq!(
+            c.peer.as_ref().unwrap().address.as_deref(),
+            Some("192.168.1.33:47800")
+        );
+        assert!(!c.peer_moved(&fp, addr), "unchanged");
+        c.set("address", "pc.local").unwrap();
+        assert!(!c.peer_moved(&fp, addr), "host names stay");
+        c.set("address", "none").unwrap();
+        assert!(!c.peer_moved(&fp, addr), "a listener has no address");
+        assert!(!Config::default().peer_moved(&fp, addr));
+    }
+
+    #[test]
+    fn old_files_without_discovery_default_to_on() {
+        let c = Config::from_toml("remap = false").unwrap();
+        assert!(c.discovery && !c.remap);
+        assert!(Config::default().to_toml().contains("discovery = true"));
     }
 }

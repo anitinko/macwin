@@ -19,9 +19,11 @@ use macwin_core::types::{CaptureFault, CapturedEvent, GrabCommand, InjectCommand
 
 pub mod fs;
 pub mod image;
+pub mod net;
 mod secrets;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod tray;
 
 pub use secrets::{FileSecretStore, SecretStore, check_secret_name};
 

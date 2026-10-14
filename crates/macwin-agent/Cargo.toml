@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "macwin"
 path = "src/main.rs"
 
+[[bin]]
+name = "macwin-tray"
+path = "src/bin/macwin-tray.rs"
+
 [features]
 default = ["private-cursor-api"]
 private-cursor-api = ["macwin-platform-macos/private-cursor-api"]

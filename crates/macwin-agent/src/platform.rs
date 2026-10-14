@@ -4,7 +4,10 @@ use std::path::Path;
 
 use macwin_platform::{FileSecretStore, PlatformError, SecretStore};
 
-pub use imp::{capture, clipboard, init, injector, permissions_report, screens};
+pub use imp::{
+    capture, clipboard, init, injector, ipv4_broadcasts, notice, permissions_report, run_tray,
+    screens,
+};
 
 use crate::driver::Backends;
 use crate::identity_store::KeyStoreKind;
@@ -74,6 +77,23 @@ mod imp {
 
     pub fn device_name() -> Option<String> {
         macwin_platform_macos::device_name()
+    }
+
+    pub fn ipv4_broadcasts() -> Vec<std::net::Ipv4Addr> {
+        macwin_platform_macos::ipv4_broadcasts()
+    }
+
+    /// Runs the menu bar icon on this (the main) thread until Quit.
+    pub fn run_tray(
+        commands: std::sync::mpsc::Receiver<macwin_platform::tray::UiCommand>,
+        events: impl Fn(macwin_platform::tray::TrayEvent) + Send + 'static,
+    ) -> Result<(), PlatformError> {
+        macwin_platform_macos::tray::run(commands, Box::new(events))
+    }
+
+    /// A message for the user when there is no tray to show it.
+    pub fn notice(message: &str) {
+        macwin_platform_macos::tray::notice(message)
     }
 
     pub fn os_secret_store(
@@ -153,6 +173,23 @@ mod imp {
         None
     }
 
+    pub fn ipv4_broadcasts() -> Vec<std::net::Ipv4Addr> {
+        macwin_platform_windows::ipv4_broadcasts()
+    }
+
+    /// Runs the notification area icon on this thread until Quit.
+    pub fn run_tray(
+        commands: std::sync::mpsc::Receiver<macwin_platform::tray::UiCommand>,
+        events: impl Fn(macwin_platform::tray::TrayEvent) + Send + 'static,
+    ) -> Result<(), PlatformError> {
+        macwin_platform_windows::tray::run(commands, Box::new(events))
+    }
+
+    /// A message for the user when there is no tray to show it.
+    pub fn notice(message: &str) {
+        macwin_platform_windows::tray::notice(message)
+    }
+
     pub fn os_secret_store(
         kind: KeyStoreKind,
         config_dir: &Path,
@@ -202,6 +239,21 @@ mod imp {
 
     pub fn device_name() -> Option<String> {
         None
+    }
+
+    pub fn ipv4_broadcasts() -> Vec<std::net::Ipv4Addr> {
+        Vec::new()
+    }
+
+    pub fn run_tray(
+        _commands: std::sync::mpsc::Receiver<macwin_platform::tray::UiCommand>,
+        _events: impl Fn(macwin_platform::tray::TrayEvent) + Send + 'static,
+    ) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    pub fn notice(message: &str) {
+        eprintln!("{message}");
     }
 
     pub fn os_secret_store(

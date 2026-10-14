@@ -34,6 +34,15 @@ pub enum Command {
     /// Share the keyboard, mouse and clipboard with the paired machine and
     /// reconnect whenever the connection drops (Ctrl+C to stop).
     Run,
+    /// Like `run`, with a menu bar (macOS) or notification area (Windows)
+    /// icon to pair, pause, choose the side and quit.
+    Tray,
+    /// Start the MacWin icon (`tray`) at login: on, off, or show whether it
+    /// does.
+    Autostart {
+        #[arg(value_enum)]
+        action: Option<Switch>,
+    },
     /// Read-only checks of this machine.
     #[command(subcommand)]
     Probe(Probe),
@@ -45,16 +54,19 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct PairArgs {
     /// The other machine's address (HOST or HOST:PORT), as printed by its
-    /// `macwin pair`. Without it, this machine waits and shows a code.
+    /// `macwin pair`. Without it, macwin looks on the local network for a
+    /// machine waiting for pairing; when there is none, this machine waits
+    /// and shows a code.
     #[arg(value_name = "HOST[:PORT]")]
     pub address: Option<String>,
     /// The code shown on the other machine (asked for when omitted).
-    #[arg(long, requires = "address")]
+    #[arg(long, conflicts_with = "listen")]
     pub code: Option<String>,
     /// Which side of this machine the other machine's screens are on.
     #[arg(long, value_enum)]
     pub side: Option<SideArg>,
-    /// Wait on ADDR:PORT instead of the configured listen address.
+    /// Only wait (no search), on ADDR:PORT instead of the configured listen
+    /// address.
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "address")]
     pub listen: Option<SocketAddr>,
 }
@@ -64,9 +76,10 @@ pub enum ConfigCmd {
     /// Print the configuration.
     Show,
     /// Change one setting. Keys: side (left|right|none), address
-    /// (HOST[:PORT]|none), listen (ADDR:PORT), remap (on|off), clipboard
-    /// (on|off), clipboard-max-kb (1-16384), clipboard-images (on|off),
-    /// clipboard-files (on|off), clipboard-files-max-mb (1-65536).
+    /// (HOST[:PORT]|none), listen (ADDR:PORT), remap (on|off), discovery
+    /// (on|off), clipboard (on|off), clipboard-max-kb (1-16384),
+    /// clipboard-images (on|off), clipboard-files (on|off),
+    /// clipboard-files-max-mb (1-65536).
     Set { key: String, value: String },
 }
 
@@ -136,6 +149,12 @@ pub struct SpikeInjectArgs {
     /// Required, so the cursor never moves by accident.
     #[arg(long, required = true)]
     pub demo: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Switch {
+    On,
+    Off,
 }
 
 /// Where the peer's screens are.
@@ -331,9 +350,13 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+        match parse(&["pair", "--code", "123456"]).unwrap().command {
+            Command::Pair(a) => assert!(a.address.is_none() && a.code.is_some(), "LAN search"),
+            other => panic!("unexpected {other:?}"),
+        }
         assert!(
-            parse(&["pair", "--code", "123456"]).is_err(),
-            "a code needs an address"
+            parse(&["pair", "--code", "123456", "--listen", "0.0.0.0:1"]).is_err(),
+            "the waiting side shows a code"
         );
         assert!(
             parse(&["pair", "pc", "--listen", "0.0.0.0:1"]).is_err(),
@@ -348,6 +371,18 @@ mod tests {
             Command::Config(ConfigCmd::Show)
         ));
         assert!(matches!(parse(&["run"]).unwrap().command, Command::Run));
+        assert!(matches!(parse(&["tray"]).unwrap().command, Command::Tray));
+        assert!(matches!(
+            parse(&["autostart"]).unwrap().command,
+            Command::Autostart { action: None }
+        ));
+        assert!(matches!(
+            parse(&["autostart", "off"]).unwrap().command,
+            Command::Autostart {
+                action: Some(Switch::Off)
+            }
+        ));
+        assert!(parse(&["autostart", "maybe"]).is_err());
         assert!(matches!(
             parse(&["unpair"]).unwrap().command,
             Command::Unpair

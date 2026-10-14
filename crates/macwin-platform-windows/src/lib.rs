@@ -10,16 +10,21 @@
 //! - Win+L and Ctrl+Alt+Del cannot be intercepted.
 #![cfg(windows)]
 
+mod autostart;
 mod capture;
 mod clipboard;
 mod dpapi;
 mod dpi;
 mod inject;
+mod net;
 mod screens;
+pub mod tray;
 
+pub use autostart::{delete_run_value, run_value, set_run_value};
 pub use capture::WinCapture;
 pub use clipboard::WinClipboard;
 pub use dpapi::DpapiStore;
 pub use dpi::init_dpi_awareness;
 pub use inject::WinInjector;
+pub use net::ipv4_broadcasts;
 pub use screens::WinScreens;

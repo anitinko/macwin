@@ -2,13 +2,14 @@
 //! different versions stop understanding each other.
 
 use macwin_core::msg::{
-    ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, Heartbeat, InputMsg, KeyMsg, MouseAbs,
-    PairMsg,
+    ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, DiscoveryMsg, DiscoveryQuery,
+    DiscoveryWant, Heartbeat, InputMsg, KeyMsg, MouseAbs, PairMsg,
 };
 use macwin_core::types::{Hid, Point, RoleKind};
 use macwin_proto::{
-    decode_clipboard, decode_control, decode_datagram, decode_input, decode_pair, encode_clipboard,
-    encode_control, encode_datagram, encode_input, encode_pair, frame,
+    decode_clipboard, decode_control, decode_datagram, decode_discovery, decode_input, decode_pair,
+    encode_clipboard, encode_control, encode_datagram, encode_discovery, encode_input, encode_pair,
+    frame,
 };
 
 #[test]
@@ -27,6 +28,21 @@ fn pair_done() {
     let bytes = encode_pair(&PairMsg::Done);
     assert_eq!(bytes, [0x1A, 0x00]);
     assert_eq!(decode_pair(&bytes).unwrap(), PairMsg::Done);
+}
+
+#[test]
+fn discovery_pairing_query() {
+    let m = DiscoveryMsg::Query(DiscoveryQuery {
+        nonce: [0xAB; 16],
+        want: DiscoveryWant::Pairing,
+    });
+    let bytes = encode_discovery(&m);
+    let mut want = b"MWD1".to_vec();
+    want.extend([0x0A, 0x14, 0x0A, 0x10]);
+    want.extend([0xAB; 16]);
+    want.extend([0x12, 0x00]);
+    assert_eq!(bytes, want);
+    assert_eq!(decode_discovery(&bytes).unwrap(), m);
 }
 
 #[test]

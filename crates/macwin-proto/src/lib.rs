@@ -10,7 +10,9 @@ mod convert;
 pub mod frame;
 pub mod wire;
 
-use macwin_core::msg::{ClipboardMsg, ControlMsg, DatagramMsg, FilesHeader, InputMsg, PairMsg};
+use macwin_core::msg::{
+    ClipboardMsg, ControlMsg, DatagramMsg, DiscoveryMsg, FilesHeader, InputMsg, PairMsg,
+};
 use prost::Message;
 
 pub use convert::check_relative_path;
@@ -45,6 +47,10 @@ pub const SPAKE_MSG_LEN: usize = 33;
 pub const PAIR_MAC_LEN: usize = 32;
 /// Largest accepted string field, in bytes.
 pub const MAX_STRING_LEN: usize = 256;
+/// First bytes of every LAN discovery datagram.
+pub const DISCOVERY_MAGIC: [u8; 4] = *b"MWD1";
+/// Largest LAN discovery datagram, magic included.
+pub const MAX_DISCOVERY_LEN: usize = 512;
 /// Most capabilities accepted in a Hello.
 pub const MAX_CAPABILITIES: usize = 32;
 /// Longest accepted capability, in bytes.
@@ -202,6 +208,31 @@ pub fn encode_pair(m: &PairMsg) -> Vec<u8> {
 
 pub fn decode_pair(b: &[u8]) -> Result<PairMsg, ProtoError> {
     convert::pair_from_wire(wire::PairFrame::decode(b)?)
+}
+
+/// [`DISCOVERY_MAGIC`] followed by the protobuf frame.
+pub fn encode_discovery(m: &DiscoveryMsg) -> Vec<u8> {
+    let mut out = DISCOVERY_MAGIC.to_vec();
+    convert::discovery_to_wire(m)
+        .encode(&mut out)
+        .expect("a Vec grows as needed");
+    out
+}
+
+pub fn decode_discovery(b: &[u8]) -> Result<DiscoveryMsg, ProtoError> {
+    if b.len() > MAX_DISCOVERY_LEN {
+        return Err(ProtoError::InvalidValue {
+            field: "discovery datagram",
+            reason: "longer than 512 bytes",
+        });
+    }
+    let body = b
+        .strip_prefix(&DISCOVERY_MAGIC)
+        .ok_or(ProtoError::InvalidValue {
+            field: "discovery datagram",
+            reason: "not a macwin discovery datagram",
+        })?;
+    convert::discovery_from_wire(wire::DiscoveryFrame::decode(body)?)
 }
 
 #[cfg(test)]

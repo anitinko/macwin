@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod codes;
+pub mod discovery;
 mod endpoint;
 pub mod fingerprint;
 pub mod identity;

@@ -2,6 +2,10 @@
 //! after every disconnect. The machine that knows the peer's address dials
 //! it; the other one listens. Only the emergency chord or a stop request
 //! (Ctrl+C) ends the loop.
+//!
+//! With LAN discovery the listener answers searches for its fingerprint,
+//! and the dialer searches after every failed dial: a peer that got a new
+//! address (a new DHCP lease) is dialed there at once.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -9,11 +13,14 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use macwin_core::engine::TransportRole;
 use macwin_core::types::RoleKind;
+use macwin_net::discovery::{Offer, Responder, find_peer};
 use macwin_net::{Fingerprint, Identity, NetError, Session, connect, listen};
 use macwin_platform::PlatformError;
 use tokio::sync::watch;
+use tracing::{debug, info, warn};
 
 use crate::driver::{Backends, Connected, SessionConfig, SessionEnd, kvm_hello, spawn_session};
+use crate::lan::Discovery;
 
 /// First reconnect delay of a dialer.
 pub const RETRY_MIN: Duration = Duration::from_secs(1);
@@ -25,6 +32,9 @@ pub const RETRY_MAX: Duration = Duration::from_secs(10);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound on letting the close of an ended session reach the peer.
 const DRAIN: Duration = Duration::from_secs(2);
+/// How long a dialer's LAN search waits for the peer (it ends at the first
+/// answer).
+pub const FIND_TIME: Duration = Duration::from_secs(1);
 
 /// How this machine finds its peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +57,8 @@ pub struct RunOptions {
     pub retry_max: Duration,
     /// Bound on one dial attempt.
     pub connect_timeout: Duration,
+    /// LAN discovery; `None` turns it off.
+    pub discovery: Option<Discovery>,
 }
 
 /// Progress reports for the user.
@@ -65,6 +77,9 @@ pub enum RunEvent {
         after: Duration,
         error: String,
     },
+    /// The peer answered a LAN search at this new address, and the session
+    /// to it succeeded (the caller may remember the address).
+    Moved(SocketAddr),
 }
 
 /// Why [`run`] returned.
@@ -86,6 +101,27 @@ pub fn bind_for(remote: SocketAddr) -> SocketAddr {
         (false, false) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
     SocketAddr::new(ip, 0)
+}
+
+/// Runs `bind` again while its address is still in use, for up to two
+/// seconds: in the tray, a session listener follows a pairing listener on
+/// the same port (and back), and a closed QUIC endpoint releases its
+/// socket a moment later.
+pub async fn bind_retrying<T, F: Future<Output = Result<T, NetError>>>(
+    mut bind: impl FnMut() -> F,
+) -> Result<T, NetError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match bind().await {
+            Err(NetError::Io(e))
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            r => return r,
+        }
+    }
 }
 
 /// Resolves `HOST:PORT` to its first address.
@@ -121,7 +157,7 @@ pub async fn run(
 ) -> anyhow::Result<RunExit> {
     let listener = match &opts.mode {
         Mode::Listen(addr) => {
-            let l = listen(*addr, &id, opts.peer)
+            let l = bind_retrying(|| listen(*addr, &id, opts.peer))
                 .await
                 .with_context(|| format!("cannot listen on {addr}"))?;
             on_event(RunEvent::Listening(l.local_addr()?));
@@ -129,6 +165,27 @@ pub async fn run(
         }
         Mode::Dial(_) => None,
     };
+    // Answers LAN searches for this machine while the loop runs.
+    let _responder = match (&listener, &opts.discovery) {
+        (Some(l), Some(d)) => {
+            let offer = Offer::Peer {
+                port: l.local_addr()?.port(),
+                fingerprint: id.fingerprint(),
+            };
+            match Responder::start(d.bind, offer).await {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!(bind = %d.bind, error = %e, "cannot answer LAN searches");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    // A dialer's address of the peer from a LAN search, used instead of the
+    // configured one, and the last one reported as `Moved`.
+    let mut found: Option<SocketAddr> = None;
+    let mut reported: Option<SocketAddr> = None;
     let retry_min = opts.retry_min.min(opts.retry_max);
     let mut backoff = retry_min;
     loop {
@@ -153,10 +210,15 @@ pub async fn run(
             },
             (Mode::Dial(target), _) => {
                 if backoff == retry_min {
-                    on_event(RunEvent::Dialing(target.clone()));
+                    on_event(RunEvent::Dialing(
+                        found.map_or_else(|| target.clone(), |a| a.to_string()),
+                    ));
                 }
                 let dial = async {
-                    let remote = resolve(target).await?;
+                    let remote = match found {
+                        Some(addr) => addr,
+                        None => resolve(target).await?,
+                    };
                     let s = tokio::time::timeout(
                         opts.connect_timeout,
                         connect(bind_for(remote), remote, &id, opts.peer, &hello),
@@ -184,6 +246,26 @@ pub async fn run(
                         error,
                     }),
                     Mode::Dial(_) => {
+                        if let Some(d) = &opts.discovery {
+                            // The peer may have a new address: ask the LAN.
+                            let targets = d.targets();
+                            let search = find_peer(&targets, opts.peer, FIND_TIME);
+                            let result = tokio::select! {
+                                r = search => r,
+                                () = stopped(&mut stop) => return Ok(RunExit::Stopped),
+                            };
+                            match result {
+                                Ok(Some(addr)) if found != Some(addr) => {
+                                    info!(%addr, error = %error, "the peer answered a LAN search");
+                                    found = Some(addr);
+                                    backoff = retry_min;
+                                    continue;
+                                }
+                                Ok(Some(_)) => {}
+                                Ok(None) => found = None,
+                                Err(e) => debug!(error = %e, "LAN search failed"),
+                            }
+                        }
                         on_event(RunEvent::Retrying {
                             after: backoff,
                             error,
@@ -202,6 +284,10 @@ pub async fn run(
             name: session.peer.device_name.clone(),
             remote: session.remote,
         });
+        if let Some(addr) = found.filter(|a| reported != Some(*a)) {
+            reported = Some(addr);
+            on_event(RunEvent::Moved(addr));
+        }
         let handle = spawn_session(
             opts.session.clone(),
             backends,

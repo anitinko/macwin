@@ -14,6 +14,7 @@ fn macwin(config: &Path) -> Command {
     let mut c = Command::new(BIN);
     c.env("MACWIN_CONFIG_DIR", config)
         .env("MACWIN_KEY_STORE", "file")
+        .env("MACWIN_DISCOVERY", "off")
         .env("RUST_LOG", "warn");
     c
 }
@@ -352,4 +353,90 @@ fn dialer_with_a_wrong_pin_fails_quickly() {
     );
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(String::from_utf8_lossy(&out.stderr).contains("error:"));
+}
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn pair_finds_the_waiting_machine_on_the_lan() {
+    let mac = tempfile::tempdir().unwrap();
+    let pc = tempfile::tempdir().unwrap();
+    let lan = format!("127.0.0.1:{}", free_udp_port());
+    let mut waiting = Guard(
+        macwin(pc.path())
+            .env("MACWIN_DISCOVERY", &lan)
+            .args(["pair", "--listen", "127.0.0.1:0", "--side", "left"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let lines = lines_of(&mut waiting);
+    let code = wait_line(&lines, "pairing code: ");
+    wait_line(&lines, "  macwin pair --code ");
+    let out = macwin(mac.path())
+        .env("MACWIN_DISCOVERY", &lan)
+        .args(["pair", "--code", &code])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout.contains("found \"") && stdout.contains("paired with"),
+        "{stdout}"
+    );
+    let waited = wait_with_timeout(waiting, Duration::from_secs(15));
+    assert!(waited.status.success(), "{waited:?}");
+    // The searching machine dials from now on, at the address it found.
+    let mac_cfg = config_of(mac.path());
+    assert!(mac_cfg.contains("address = \"127.0.0.1:"), "{mac_cfg}");
+    assert!(mac_cfg.contains("side = \"right\""), "{mac_cfg}");
+    assert!(!config_of(pc.path()).contains("address ="));
+}
+
+#[test]
+fn pair_with_a_code_and_nobody_waiting_explains_what_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let lan = format!("127.0.0.1:{}", free_udp_port());
+    let out = macwin(dir.path())
+        .env("MACWIN_DISCOVERY", &lan)
+        .args(["pair", "--code", "123456"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no machine waiting for pairing"),
+        "{stderr}"
+    );
+    let off = macwin(dir.path())
+        .args(["pair", "--code", "123456"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&off.stderr).contains("LAN discovery is off"));
+}
+
+#[test]
+fn a_second_agent_with_the_same_config_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut waiting = Guard(
+        macwin(dir.path())
+            .args(["pair", "--listen", "127.0.0.1:0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let lines = lines_of(&mut waiting);
+    wait_line(&lines, "pairing code: ");
+    let out = macwin(dir.path()).arg("run").output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already running"), "{stderr}");
 }

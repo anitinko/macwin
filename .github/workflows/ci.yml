@@ -34,6 +34,20 @@ jobs:
         run: cargo test --workspace --all-features --locked
       - name: Generated keymap is up to date
         run: cargo run -p keymap-gen --locked -- --check
+      - name: Shell scripts parse
+        shell: bash
+        run: for f in scripts/*/*.sh; do bash -n "$f"; done
+      - name: PowerShell scripts parse
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem scripts/windows/*.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { Write-Host "$($f.Name): $e"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
 
   # cargo-deny-action is a Docker action and only runs on Linux; deny.toml's
   # [graph] targets make it check the macOS and Windows dependency graphs.

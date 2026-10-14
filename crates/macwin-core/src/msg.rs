@@ -283,3 +283,52 @@ pub struct PairHello {
 pub struct PairConfirm {
     pub mac: [u8; 32],
 }
+
+/// Length of the random nonce of a discovery query.
+pub const DISCOVERY_NONCE_LEN: usize = 16;
+
+/// LAN discovery datagrams (UDP broadcast). Discovery is unauthenticated:
+/// an answer only suggests an address, and the pairing code or the pinned
+/// certificate decides whether it is the right machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryMsg {
+    Query(DiscoveryQuery),
+    Answer(DiscoveryAnswer),
+}
+
+/// "Who is there?", broadcast by a machine looking for another one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryQuery {
+    /// Random; echoed by answers and mixed into peer tags.
+    pub nonce: [u8; DISCOVERY_NONCE_LEN],
+    pub want: DiscoveryWant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryWant {
+    /// Machines waiting for pairing.
+    Pairing,
+    /// The paired machine whose certificate fingerprint hashes, with the
+    /// nonce, to `tag` (the fingerprint itself never travels).
+    Peer { tag: [u8; 32] },
+}
+
+/// A listening machine's answer, sent to the asker only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryAnswer {
+    /// The query's nonce.
+    pub nonce: [u8; DISCOVERY_NONCE_LEN],
+    /// `major << 16 | minor`.
+    pub protocol_version: u32,
+    /// The UDP port of the pairing or session listener.
+    pub port: u16,
+    pub offer: DiscoveryOffer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryOffer {
+    /// A machine waiting for pairing.
+    Pairing { os: Os, device_name: String },
+    /// The paired machine: `proof` hashes the nonce with its fingerprint.
+    Peer { proof: [u8; 32] },
+}

@@ -34,4 +34,12 @@ or launch MacWin.app on this Mac, tests on 127.0.0.1, pinned permissive deps, Ru
   remembers the last image it read or wrote with a hash of its decoded pixels and reports a
   re-encoded copy with the earlier bytes (core keeps comparing bytes). Pixel wheel is gated by
   capability input.wheel-pixel; older peers get Notch120 (40 px = 1 notch).
-- Next: Phase 3.
+- Phase 3 done (phase3-plan.md, phase3-report.md): LAN discovery (UDP 47801; pairing without an
+  IP, re-finding a peer that moved), `macwin autostart` (LaunchAgent / HKCU Run), the tray app
+  (macOS menu bar, Windows notification area; logic tested with a fake UI), one agent per user
+  (lock file), dmg + Windows zip with install.ps1 / uninstall.ps1, `dist` profile. Work moved to a
+  Linux sandbox: macOS and Windows code is type-checked with cross clippy and runs in CI.
+- Phase 4: feasibility study and design only (phase4-design.md): SYSTEM service + per-session
+  helper for the Winlogon desktop and elevated windows; needs owner decisions (admin install in
+  Program Files, code signing, Ctrl+Alt+Del policy) before it is built.
+- Next: hardware test of phases 0b-3 (checklists in the reports), then the Phase 4 decisions.

@@ -21,6 +21,13 @@ lto = "thin"
 debug = "line-tables-only"
 # `panic` stays `unwind`: FFI callbacks rely on `catch_unwind`.
 
+# Packaged builds (scripts/macos/dmg.sh, scripts/windows/package.sh): no
+# debug info, no symbols.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true
+
 [workspace.dependencies]
 # Internal crates.
 macwin-core = { path = "crates/macwin-core" }
@@ -71,30 +78,48 @@ objc2-core-graphics = { version = "=0.3.2", default-features = false, features =
 ] }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "std",
+    "NSApplication",
     "NSBitmapImageRep",
+    "NSButton",
+    "NSCell",
+    "NSControl",
     "NSEvent",
+    "NSImage",
     "NSImageRep",
+    "NSMenu",
+    "NSMenuItem",
     "NSPasteboard",
     "NSPasteboardItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+    "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",
     "NSArray",
     "NSData",
+    "NSDate",
     "NSDictionary",
     "NSProcessInfo",
     "NSString",
+    "NSTimer",
     "NSURL",
 ] }
 security-framework = { version = "=3.7.0", default-features = false }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
     "Win32_Security_Cryptography",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

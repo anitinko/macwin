@@ -16,12 +16,15 @@ mod cursor;
 mod host;
 mod inject;
 mod keychain;
+mod net;
 pub mod permissions;
 mod screens;
+pub mod tray;
 
 pub use capture::MacCapture;
 pub use clipboard::MacClipboard;
 pub use host::device_name;
 pub use inject::MacInjector;
 pub use keychain::KeychainStore;
+pub use net::ipv4_broadcasts;
 pub use screens::MacScreens;
